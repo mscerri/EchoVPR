@@ -128,3 +128,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+/src/pretrained_models/
+/src/data/
+/src/checkpoints/
+/src/wandb/
+/src/artifacts/
