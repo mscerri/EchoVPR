@@ -6,7 +6,7 @@ from collections import OrderedDict
 import torch
 from torch import nn
 
-from configs.utils import get_config
+from configs.utils import get_config_wandb
 from echovpr.datasets.utils import load_np_file, save_np_file
 from echovpr.trainer.utils.simple_processor import process_dataset
 
@@ -27,14 +27,21 @@ os.environ["WANDB_SILENT"] = "true"
 parser = argparse.ArgumentParser(description='echovpr')
 parser.add_argument('--config_file', type=str, required=True,
                     help='Location of config file to load defaults from')
-parser.add_argument('--checkpoint_dir', type=str, required=True, help='Checkpoint directory where the saved models could be located')
+parser.add_argument('--project', type=str, default=None, help='Wandb Project')
+parser.add_argument('--entity', type=str, default=None, help='Wandb Entity')
+parser.add_argument('--artifact_name', type=str, required=True,
+                    help='Artifact name in WandB to export hidden representations from')
+parser.add_argument('--model_name', type=str, default='model.pt',
+                    help='Model name located in the artifact')
+
 
 def main(options):
 
     # Setup config
-    config = get_config(options.config_file, logger=log)['main']
+    run, config = get_config_wandb(
+        options.config_file, project=options.project, entity=options.entity, logger=log, log=False)
 
-    model_tensor = load_model(options.checkpoint_dir, 'model.pt')
+    model_tensor = load_model(run, options.artifact_name, options.model_name)
 
     # Setup ESN
     in_features = int(config['model_in_features'])
@@ -69,8 +76,12 @@ def main(options):
         hidden_repr = process_dataset(dataset_name, dataset, encoder, config, device, logger=log).numpy()
         save_np_file(hidden_repr, destination)
 
+    run.finish()
 
-def load_model(model_dir: str, model_name: str) -> str:
+
+def load_model(run, artifact_name: str, model_name: str) -> str:
+    model_artifact = run.use_artifact(artifact_name, type='model')
+    model_dir = model_artifact.download()
     return torch.load(os.path.join(model_dir, model_name))
 
 

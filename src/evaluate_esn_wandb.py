@@ -5,7 +5,10 @@ import os
 import torch
 from torch import nn
 
-from configs.utils import (get_bool_from_config, get_config, get_value_from_namespace_or_raise, update_config)
+from configs.utils import (get_bool_from_config, get_config, get_config_wandb,
+                           get_value_from_namespace,
+                           get_value_from_namespace_or_raise,
+                           update_config_wandb)
 from echovpr.models.single_esn import SingleESN
 from echovpr.models.sparce_layer import SpaRCe
 from echovpr.models.utils import get_sparsity
@@ -32,9 +35,15 @@ os.environ["WANDB_SILENT"] = "true"
 
 parser = argparse.ArgumentParser(description='echovpr', argument_default=argparse.SUPPRESS)
 parser.add_argument('--config_file', type=str, required=True, help='Location of config file to load defaults from')
-parser.add_argument('--checkpoint_dir', type=str, required=True, help='Checkpoint directory where the saved models could be located')
 
-parser.add_argument('--validation', type=str, default='True', help='Whether to run validation')
+parser.add_argument('--project', type=str, default=None, help='Wandb Project')
+parser.add_argument('--entity', type=str, default=None, help='Wandb Entity')
+
+parser.add_argument('--artifact_name', type=str, help='Artifact name in WandB to be used as the checkpoint model model')
+
+parser.add_argument('--checkpoint_dir', type=str, help='Checkpoint directory where the saved models could be located')
+
+parser.add_argument('--validation', type=bool, default=True, help='Whether to run validation')
 
 parser.add_argument('--model_reservoir_size', type=int, help='EchoStateNetwork parameter: Number of neurons')
 parser.add_argument('--model_esn_num_connections', type=int, help='EchoStateNetwork parameter: Number of average recurrent connections per neuron')
@@ -52,9 +61,9 @@ parser.add_argument('--index_input_features_dir', type=str, help='Required when 
 def main(options: argparse.Namespace):
 
     # Setup config
-    config = get_config(options.config_file, logger=log)['main']
+    run, config = get_config_wandb(options.config_file, project=get_value_from_namespace(options, 'project', None), entity=get_value_from_namespace(options, 'entity', None), logger=log, log=False)
     
-    config = update_config(config, options.__dict__)
+    config = update_config_wandb(run, options, logger=log, log=True)
 
     # Setup ESN
     in_features=int(config['model_in_features'])
@@ -77,7 +86,7 @@ def main(options: argparse.Namespace):
         device=device
     )
 
-    esn_model_tensor = load_model(options.checkpoint_dir, 'esn_model.pt')
+    esn_model_tensor = load_model(run, options.artifact_name, 'esn_model.pt')
     model_esn.load_state_dict(esn_model_tensor)
 
     model = nn.ModuleDict()
@@ -87,7 +96,7 @@ def main(options: argparse.Namespace):
 
     model["out"] = nn.Linear(in_features=reservoir_size, out_features=out_features, bias=True)
 
-    model_tensor = load_model(options.checkpoint_dir, 'model.pt')
+    model_tensor = load_model(run, options.artifact_name, 'model.pt')
     model.load_state_dict(model_tensor, strict=False)
 
     # Move to device
@@ -113,12 +122,14 @@ def main(options: argparse.Namespace):
     n_values = [1, 5, 10, 20, 50, 100]
     top_k = max(n_values)
     
-    if get_bool_from_config(config, 'validation', True):
+    if options.validation:
         _, val_predictions = run_eval(model, val_dataLoader, eval_gt, n_values, top_k, device, model_forward=model_forward, sparce_enabled=sparce_enabled, dataset_quantiles=val_dataset_quantiles)
         val_recalls = compute_recall(eval_gt, val_predictions, len(val_predictions), n_values, print_recall=True, recall_str='Eval on Validation Set')
+        set_summary_props(run, val_recalls, 'best_val_recall')
     
     _, test_predictions = run_eval(model, test_dataLoader, eval_gt, n_values, top_k, device, model_forward=model_forward, sparce_enabled=sparce_enabled, dataset_quantiles=val_dataset_quantiles)
     test_recalls = compute_recall(eval_gt, test_predictions, len(test_predictions), n_values, print_recall=True, recall_str='Eval on Test Set')
+    set_summary_props(run, test_recalls, 'best_test_recall')
 
     if 'patchnetvlad_config_file' in options:
         patchnetvlad_config = get_config(options.patchnetvlad_config_file, log)
@@ -126,19 +137,25 @@ def main(options: argparse.Namespace):
 
         input_index_local_features_prefix = os.path.join(get_value_from_namespace_or_raise(options, 'index_input_features_dir'), 'patchfeats')
 
-        if get_bool_from_config(config, 'validation', True):
+        if options.validation:
             input_val_local_features_prefix = os.path.join(get_value_from_namespace_or_raise(options, 'val_input_features_dir'), 'patchfeats')
             
             reranked_val_predictions = local_matcher(val_predictions, patchnetvlad_config, input_val_local_features_prefix, input_index_local_features_prefix, val_test_dataset_info, train_dataset_info, device)
             val_patch_recalls = compute_recall(eval_gt, reranked_val_predictions, len(val_predictions), n_values, print_recall=True, recall_str='PatchNetVLAD Eval on Validation Set')
+            set_summary_props(run, val_patch_recalls, 'best_val_patch_recall')    
 
         input_test_local_features_prefix = os.path.join(get_value_from_namespace_or_raise(options, 'test_input_features_dir'), 'patchfeats')
 
         reranked_test_predictions = local_matcher(test_predictions, patchnetvlad_config, input_test_local_features_prefix, input_index_local_features_prefix, val_test_dataset_info, train_dataset_info, device)
         test_patch_recalls = compute_recall(eval_gt, reranked_test_predictions, len(test_predictions), n_values, print_recall=True, recall_str='PatchNetVLAD Eval on Test Set')
+        set_summary_props(run, test_patch_recalls, 'best_test_patch_recall')
+
+    run.finish()
 
 
-def load_model(model_dir: str, model_name: str) -> str:
+def load_model(run, artifact_name: str, model_name: str) -> str:
+    model_artifact = run.use_artifact(artifact_name, type='model')
+    model_dir = model_artifact.download()
     return torch.load(os.path.join(model_dir, model_name))
 
 def model_forward(model, x, kwargs):
@@ -147,6 +164,10 @@ def model_forward(model, x, kwargs):
     
     y = model["out"](x)
     return y
+
+def set_summary_props(run, recall_dic, key_prefix):
+    for key in recall_dic:
+        run.summary[f"{key_prefix}@{key}"] = recall_dic[key]
 
 if __name__ == '__main__':
     options, unknowns = parser.parse_known_args()
